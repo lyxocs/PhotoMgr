@@ -1,0 +1,400 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>选片审核</title>
+<style>
+:root{color-scheme:dark;--base:#191b17;--panel:#242720;--edge:#3a3f33;--ink:#f0f0e8;--muted:#b9bfad;--accent:#dbec98}
+*{box-sizing:border-box}
+body{margin:0;background:var(--base);color:var(--ink);font:15px/1.55 "Microsoft YaHei UI","Segoe UI",sans-serif}
+button,select,input[type=text],input[type=password]{font:inherit;border:1px solid var(--edge);border-radius:7px;background:var(--panel);color:var(--ink);padding:8px 12px}
+button,select,input[type=checkbox],summary{cursor:pointer}
+button:hover,select:hover{border-color:var(--accent)}
+button.primary{background:var(--accent);border-color:var(--accent);color:#232916;font-weight:700}
+button:disabled{opacity:.5;cursor:wait}
+main,header>div{max-width:1380px;margin:auto;padding:0 30px}
+header{position:sticky;top:0;z-index:2;background:#1b1d18;border-bottom:1px solid var(--edge)}
+header>div{display:flex;justify-content:space-between;gap:12px;align-items:center;flex-wrap:wrap;padding-top:13px;padding-bottom:13px}
+h1{font-size:23px;letter-spacing:.02em;margin:0}
+h2{font-size:18px;margin:0}
+p{margin:0}
+small,.muted{color:var(--muted)}
+.toolbar,.filters{display:flex;align-items:center;gap:9px;flex-wrap:wrap}
+.filters{margin:22px 0 12px}
+#status{min-height:30px;white-space:pre-wrap;overflow-wrap:anywhere}
+section{margin:0 0 27px}
+.group-head{display:flex;align-items:baseline;gap:12px;border-top:1px solid var(--edge);padding:13px 0}
+.cards{display:grid;grid-template-columns:repeat(auto-fill,minmax(min(100%,245px),1fr));gap:13px}
+article{min-width:0;border:1px solid var(--edge);border-radius:9px;overflow:hidden;background:var(--panel)}
+article[data-selected=true]{border-color:#a6bb67}
+.image{background:#141511;display:block;padding:0;width:100%;border:0;border-radius:0}
+.image img{width:100%;height:245px;display:block;object-fit:contain}
+.meta{padding:12px}
+.meta-top{display:flex;justify-content:space-between;align-items:center;gap:8px}
+.meta-top label{display:flex;gap:6px;align-items:center}
+input{accent-color:var(--accent)}
+.total{color:var(--accent);font-size:22px;font-weight:650;font-variant-numeric:tabular-nums}
+.tag{font-size:13px;color:var(--accent);margin:4px 0}
+.details{margin-top:8px;color:var(--muted);font-size:13px}
+dl{margin:6px 0 0}
+dl div{display:flex;justify-content:space-between;gap:8px}
+dd{margin:0;color:var(--ink)}
+dialog{border:1px solid var(--edge);border-radius:10px;background:#181a16;color:var(--ink);max-width:96vw;max-height:96vh;padding:10px}
+dialog::backdrop{background:#000b}
+dialog img{display:block;object-fit:contain;max-width:90vw;max-height:82vh}
+#source,#job{overflow-wrap:anywhere}
+#batch{max-width:min(65vw,420px)}
+#importDialog{width:min(580px,95vw)}
+#importDialog form{display:grid;gap:12px;padding:8px}
+#importDialog input{width:100%}
+#folders{display:grid;gap:5px;max-height:35vh;overflow:auto}
+#folders button{text-align:left;overflow-wrap:anywhere}
+#jobProgress{width:min(100%,360px);accent-color:var(--accent)}
+.dialog-bar{display:flex;justify-content:space-between;gap:12px;align-items:center;padding-bottom:8px}
+@media(max-width:600px){main,header>div{padding-left:14px;padding-right:14px}.image img{height:260px}}
+</style>
+</head>
+<body>
+<header><div>
+<div><h1>选片审核</h1><small id="counts">读取照片中…</small></div>
+<div class="toolbar">
+<button id="save">保存审核</button>
+<button id="original">导出原始 JPG</button>
+<button id="adjusted" class="primary">自动调色并导出</button>
+</div>
+</div></header>
+<main>
+<div class="filters">
+<label>照片批次 <select id="batch"></select></label>
+<button id="newBatch" class="primary">新建批次</button>
+<button id="resume" hidden>续跑当前批次</button>
+</div>
+<p id="source" class="muted"></p>
+<p id="job" role="status"></p>
+<progress id="jobProgress" hidden></progress>
+<div class="filters">
+<label>显示 <select id="filter"><option value="all">全部照片</option><option value="selected">已勾选</option><option value="maybe">AI 候选</option><option value="duplicate">有重复副本</option><option value="pending">待评分</option></select></label>
+<button id="refresh">刷新评分</button>
+</div>
+<p id="status" class="muted" role="status" aria-live="polite"></p>
+<div id="groups"></div>
+</main>
+<dialog id="viewer"><div class="dialog-bar"><span id="viewerName"></span><div class="toolbar"><button id="compare">看调色版</button><button id="close">关闭</button></div></div><img id="viewerImage" alt=""></dialog>
+<dialog id="importDialog">
+<form id="importForm">
+<h2 id="importTitle">新建批次</h2>
+<div id="folderPicker">
+<label>照片文件夹 <input type="text" id="folderPath" placeholder="F:&#92;photo&#92;照片文件夹"></label>
+<div class="toolbar"><button id="browse" type="button">浏览文件夹</button><button id="up" type="button" hidden>上一级</button></div>
+<div id="folders" aria-label="子文件夹"></div>
+<small>会扫描所选文件夹及其子文件夹中的所有 JPG/JPEG。</small>
+</div>
+<label>TokenLink API Key <input type="password" id="apiKey" autocomplete="off" placeholder="已配置环境变量时可留空"></label>
+<small>hy4 会收到用于评分的照片缩略图。</small>
+<p id="importError" role="status"></p>
+<div class="toolbar"><button id="start" class="primary">开始去重、分组和评分</button><button id="cancelImport" type="button">取消</button></div>
+</form>
+</dialog>
+<script>
+const byId = id => document.getElementById(id);
+const names = {composition:"构图与视觉平衡",light:"光线与色彩",moment:"主体与瞬间",technical:"技术质量",impact:"独特性与感染力"};
+const decisions = {pick:"AI 推荐",maybe:"AI 候选",skip:"AI 不推荐"};
+let project;
+let token;
+let activeBatch;
+let resumeBatch;
+let folderParent = "";
+let refreshVersion = 0;
+const phases = {queued:"等待处理",scanning:"正在扫描和去重",grouping:"正在分组",scoring:"hy4 正在评分",
+                complete:"处理完成",error:"处理未完成",interrupted:"处理已中断，可续跑"};
+const running = new Set(["queued","scanning","grouping","scoring"]);
+let changed = {};
+let dirty = false;
+let viewerSource;
+let adjustedPreview = false;
+let refreshTimer;
+const status = message => { byId("status").textContent = message; };
+function element(tag, text, className) {
+  const node = document.createElement(tag);
+  if (text !== undefined) node.textContent = text;
+  if (className) node.className = className;
+  return node;
+}
+function allPhotos() { return project.groups.flatMap(group => group.photos); }
+function counts() {
+  const photos = allPhotos();
+  byId("counts").textContent = project.input_count + " 个文件 · " + photos.length + " 张去重后照片 · " +
+    project.groups.length + " 组 · " + photos.filter(photo => photo.rating).length + " 张已评分 · " +
+    photos.filter(photo => photo.selected).length + " 张已勾选";
+}
+function show(photo) {
+  const src = "/preview/" + photo.id + ".jpg";
+  const card = element("article");
+  card.dataset.selected = photo.selected;
+  const preview = element("button", undefined, "image");
+  preview.type = "button";
+  preview.setAttribute("aria-label", "放大 " + photo.name);
+  const img = element("img");
+  img.src = src;
+  img.alt = photo.name;
+  img.loading = "lazy";
+  preview.append(img);
+  preview.onclick = () => {
+    viewerSource = src;
+    adjustedPreview = false;
+    byId("compare").textContent = "看调色版";
+    byId("viewerImage").src = src;
+    byId("viewerImage").alt = photo.name;
+    byId("viewerName").textContent = photo.name;
+    byId("viewer").showModal();
+  };
+  const meta = element("div", undefined, "meta");
+  const row = element("div", undefined, "meta-top");
+  const label = element("label");
+  const box = element("input");
+  box.type = "checkbox";
+  box.checked = photo.selected;
+  box.onchange = () => {
+    photo.selected = box.checked;
+    changed[photo.id] = box.checked;
+    dirty = true;
+    card.dataset.selected = box.checked;
+    counts();
+    if (byId("filter").value === "selected" && !box.checked) render();
+  };
+  label.append(box, document.createTextNode(photo.name));
+  row.append(label);
+  if (photo.rating) row.append(element("span", photo.rating.total.toFixed(1), "total"));
+  meta.append(row);
+  const rating = photo.rating;
+  if (rating) {
+    meta.append(element("p", decisions[rating.decision] + (rating.technical_issue ? " · 有技术缺陷" : ""), "tag"),
+                element("p", rating.reason));
+    const details = element("details", undefined, "details");
+    details.append(element("summary", "查看五项评分"));
+    const list = element("dl");
+    for (const [key, weight] of Object.entries(project.weights)) {
+      const line = element("div");
+      line.append(element("dt", names[key] + " · " + weight + "%"), element("dd", rating.scores[key] + " / 10"));
+      list.append(line);
+    }
+    details.append(list);
+    meta.append(details);
+  } else meta.append(element("p", photo.filtered ? "模型未评分 · 请人工审核" : "待 hy4 评分", "muted"));
+  if (photo.duplicates.length) meta.append(element("p", "重复副本：" + photo.duplicates.join("、"), "details"));
+  card.append(preview, meta);
+  return card;
+}
+function render() {
+  counts();
+  const root = byId("groups");
+  root.replaceChildren();
+  const filter = byId("filter").value;
+  const match = {
+    all: () => true, selected: photo => photo.selected, maybe: photo => photo.rating?.decision === "maybe",
+    duplicate: photo => photo.duplicates.length, pending: photo => !photo.rating
+  }[filter];
+  for (const group of project.groups) {
+    const photos = group.photos.filter(match);
+    if (!photos.length) continue;
+    const section = element("section");
+    const head = element("div", undefined, "group-head");
+    head.append(element("h2", "第 " + group.id + " 组"), element("small", group.photos.length + " 张"));
+    const cards = element("div", undefined, "cards");
+    cards.append(...photos.map(show));
+    section.append(head, cards);
+    root.append(section);
+  }
+  if (!root.children.length) root.append(element("p", "没有符合当前筛选条件的照片。", "muted"));
+}
+function showProgress(updated) {
+  const progress = updated.progress;
+  const {phase, done, total, message} = progress;
+  byId("job").textContent = [phases[phase], total && phase !== "grouping" ? done + " / " + total : "", message]
+    .filter(Boolean).join(" · ");
+  const meter = byId("jobProgress");
+  meter.hidden = !running.has(phase);
+  if (total && phase !== "grouping") {
+    meter.max = total;
+    meter.value = done;
+  } else meter.removeAttribute("value");
+  byId("resume").hidden = !["error", "interrupted"].includes(phase);
+}
+async function refresh(quiet = false) {
+  clearTimeout(refreshTimer);
+  const version = ++refreshVersion;
+  const id = activeBatch;
+  if (!id) return;
+  try {
+    const response = await fetch("/api/project?batch=" + encodeURIComponent(id));
+    const updated = await response.json();
+    if (version !== refreshVersion) return;
+    if (!response.ok) throw Error(updated.error);
+    showProgress(updated);
+    const active = running.has(updated.progress.phase);
+    const photoState = state => JSON.stringify(state.groups.map(group =>
+      group.photos.map(photo => [photo.id, !!photo.rating, !!photo.filtered])));
+    const redraw = !project || photoState(project) !== photoState(updated);
+    const interacting = byId("viewer").open || byId("groups").contains(document.activeElement);
+    if (active || (quiet && redraw && interacting)) refreshTimer = setTimeout(() => refresh(true), 2500);
+    if (quiet && (!redraw || interacting)) return;
+    project = updated;
+    for (const photo of allPhotos()) {
+      if (Object.hasOwn(changed, photo.id)) photo.selected = changed[photo.id];
+    }
+    byId("source").textContent = updated.source || updated.progress.source || "";
+    render();
+    if (!quiet) status(updated.errors.length ? updated.errors.length + " 个文件读取失败。" : "");
+  } catch (error) {
+    if (version !== refreshVersion) return;
+    if (quiet) refreshTimer = setTimeout(() => refresh(true), 5000);
+    else status(error.message);
+  }
+}
+async function post(path, payload, batch = activeBatch) {
+  const url = path + (batch ? "?batch=" + encodeURIComponent(batch) : "");
+  const response = await fetch(url, {method:"POST",headers:{"Content-Type":"application/json","X-Review-Token":token},
+                                    body:JSON.stringify(payload)});
+  const result = await response.json();
+  if (!response.ok) throw Error(result.error);
+  return result;
+}
+async function loadBatches() {
+  const response = await fetch("/api/batches");
+  if (!response.ok) throw Error("读取批次失败");
+  const data = await response.json();
+  token = data.token;
+  const options = data.batches.map(item => {
+    const option = element("option", item.source.split(/[\\/]/).filter(Boolean).at(-1) || item.source);
+    option.title = item.source;
+    option.value = item.id;
+    return option;
+  });
+  byId("batch").replaceChildren(...options);
+  return data.batches;
+}
+async function switchBatch(id) {
+  if (dirty && activeBatch) await post("/api/review", {choices:changed}, activeBatch);
+  activeBatch = id;
+  project = undefined;
+  changed = {};
+  dirty = false;
+  byId("batch").value = id;
+  byId("source").textContent = "";
+  byId("job").textContent = "";
+  byId("jobProgress").hidden = true;
+  byId("resume").hidden = true;
+  localStorage.setItem("photo-review-batch", id);
+  byId("groups").replaceChildren();
+  await refresh();
+}
+let folderVersion = 0;
+async function browse(path) {
+  const version = ++folderVersion;
+  const result = await post("/api/folder", {path});
+  if (version !== folderVersion) return;
+  folderParent = result.parent;
+  byId("folderPath").value = result.path;
+  byId("up").hidden = !result.path;
+  byId("folders").replaceChildren(...result.folders.map(folder => {
+    const button = element("button", folder.name);
+    button.type = "button";
+    button.onclick = () => browseSafely(folder.path);
+    return button;
+  }));
+}
+async function browseSafely(path) {
+  byId("importError").textContent = "";
+  try { await browse(path); }
+  catch (error) { byId("importError").textContent = error.message; }
+}
+function openImport(batch) {
+  resumeBatch = batch;
+  byId("importTitle").textContent = batch ? "续跑当前批次" : "新建批次";
+  byId("start").textContent = batch ? "继续处理" : "开始去重、分组和评分";
+  byId("folderPicker").hidden = !!batch;
+  byId("importError").textContent = "";
+  byId("importDialog").showModal();
+  if (!batch && !byId("folderPath").value) browseSafely(project?.source || "F:\\photo");
+}
+byId("newBatch").onclick = () => openImport(null);
+byId("resume").onclick = () => openImport(activeBatch);
+byId("browse").onclick = () => browseSafely(byId("folderPath").value.trim());
+byId("up").onclick = () => browseSafely(folderParent);
+byId("cancelImport").onclick = () => byId("importDialog").close();
+byId("batch").onchange = async () => {
+  try { await switchBatch(byId("batch").value); }
+  catch (error) {
+    byId("batch").value = activeBatch;
+    status("无法保存当前审核：" + error.message);
+  }
+};
+byId("importForm").onsubmit = async event => {
+  event.preventDefault();
+  const button = byId("start");
+  button.disabled = true;
+  try {
+    if (dirty && activeBatch) {
+      await post("/api/review", {choices:changed});
+      dirty = false;
+    }
+    const result = await post("/api/batches", {
+      source: byId("folderPath").value.trim(), batch: resumeBatch, key: byId("apiKey").value
+    });
+    byId("apiKey").value = "";
+    await loadBatches();
+    await switchBatch(result.batch);
+    byId("importDialog").close();
+  } catch (error) { byId("importError").textContent = error.message; }
+  finally { button.disabled = false; }
+};
+async function initialize() {
+  try {
+    const batches = await loadBatches();
+    const previous = localStorage.getItem("photo-review-batch");
+    const id = batches.find(batch => batch.id === previous)?.id || batches[0]?.id;
+    if (id) await switchBatch(id);
+    else byId("counts").textContent = "请选择照片文件夹";
+  } catch (error) { status(error.message); }
+}
+async function act(button, operation) {
+  if (!project) return;
+  button.disabled = true;
+  try { await operation(); }
+  catch (error) { status(error.message); }
+  finally { button.disabled = false; }
+}
+byId("filter").onchange = () => { if (project) render(); };
+byId("refresh").onclick = () => refresh();
+byId("compare").onclick = () => {
+  adjustedPreview = !adjustedPreview;
+  byId("viewerImage").src = viewerSource + (adjustedPreview ? "?adjusted=1" : "");
+  byId("compare").textContent = adjustedPreview ? "看原图" : "看调色版";
+};
+byId("close").onclick = () => byId("viewer").close();
+byId("save").onclick = () => act(byId("save"), async () => {
+  const id = activeBatch;
+  const savedChoices = {...changed};
+  await post("/api/review", {choices:savedChoices}, id);
+  if (id !== activeBatch) return;
+  for (const [key, value] of Object.entries(savedChoices)) {
+    if (changed[key] === value) delete changed[key];
+  }
+  dirty = Object.keys(changed).length > 0;
+  status("已保存审核。");
+});
+for (const [id, mode] of [["original","original"],["adjusted","adjusted"]]) {
+  byId(id).onclick = () => act(byId(id), async () => {
+    status("正在导出…");
+    const choices = Object.fromEntries(allPhotos().map(photo => [photo.id, photo.selected]));
+    const result = await post("/api/export", {choices, mode});
+    status("已导出 " + result.count + " 张\n" + result.folder +
+           (result.failures.length ? "\n" + result.failures.join("\n") : ""));
+  });
+}
+window.addEventListener("beforeunload", event => { if (dirty) event.preventDefault(); });
+initialize();
+</script>
+</body>
+</html>
