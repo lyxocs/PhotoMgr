@@ -25,6 +25,9 @@ small,.muted{color:var(--muted)}
 #status{min-height:30px;white-space:pre-wrap;overflow-wrap:anywhere}
 section{margin:0 0 27px}
 .group-head{display:flex;align-items:baseline;gap:12px;border-top:1px solid var(--edge);padding:13px 0}
+.capture-day{margin-bottom:36px}
+.capture-day .similar-group{margin-left:clamp(8px,2vw,24px)}
+.similar-group h3{margin:0;font-size:1rem}
 .cards{display:grid;grid-template-columns:repeat(auto-fill,minmax(min(100%,245px),1fr));gap:13px}
 article{min-width:0;border:1px solid var(--edge);border-radius:9px;overflow:hidden;background:var(--panel)}
 article[data-selected=true]{border-color:#a6bb67}
@@ -42,7 +45,14 @@ dl div{display:flex;justify-content:space-between;gap:8px}
 dd{margin:0;color:var(--ink)}
 dialog{border:1px solid var(--edge);border-radius:10px;background:#181a16;color:var(--ink);max-width:96vw;max-height:96vh;padding:10px}
 dialog::backdrop{background:#000b}
-dialog img{display:block;object-fit:contain;max-width:90vw;max-height:82vh}
+#viewer[open]{box-sizing:border-box;width:98vw;height:96dvh;max-width:none;max-height:none;display:flex;flex-direction:column;gap:6px}
+.viewer-stage{flex:1;min-height:0;overflow:auto;background:#11120f;overscroll-behavior:contain;touch-action:none}
+.viewer-canvas{display:grid;place-items:center;width:max-content;height:max-content;min-width:100%;min-height:100%}
+.viewer-stage img{display:block;max-width:none;user-select:none;cursor:zoom-in}
+.viewer-stage[data-zoomed] img{cursor:grab}
+.viewer-stage[data-dragging] img{cursor:grabbing}
+#viewerStatus{margin:0;color:var(--muted)}
+#viewerStatus:empty{display:none}
 #source,#job{overflow-wrap:anywhere}
 #batch{max-width:min(65vw,420px)}
 #importDialog{width:min(580px,95vw)}
@@ -69,18 +79,43 @@ dialog img{display:block;object-fit:contain;max-width:90vw;max-height:82vh}
 <label>照片批次 <select id="batch"></select></label>
 <button id="newBatch" class="primary">新建批次</button>
 <button id="resume" hidden>续跑当前批次</button>
+<button id="rescore" hidden>按新分组重评</button>
+<button id="refineGroups" hidden>hy4 优化分组</button>
 </div>
 <p id="source" class="muted"></p>
 <p id="job" role="status"></p>
 <progress id="jobProgress" hidden></progress>
 <div class="filters">
-<label>显示 <select id="filter"><option value="all">全部照片</option><option value="selected">已勾选</option><option value="maybe">AI 候选</option><option value="duplicate">有重复副本</option><option value="pending">待评分</option></select></label>
+<label>显示 <select id="filter"><option value="all">全部照片</option><option value="ranking">高分榜</option><option value="selected">已勾选</option><option value="maybe">AI 候选</option><option value="duplicate">有重复副本</option><option value="pending">待评分</option><option value="blurred">已标记模糊</option></select></label>
+<label id="groupOptions">分组 <select id="groupBy"><option value="date">拍摄日期 → 相似照片</option><option value="similar">仅相似照片</option></select></label>
+<label id="rankOptions" hidden>榜单范围 <select id="rankLimit"><option value="30">前 30 张</option><option value="100">前 100 张</option><option value="all">全部已评分</option></select></label>
 <button id="refresh">刷新评分</button>
 </div>
 <p id="status" class="muted" role="status" aria-live="polite"></p>
 <div id="groups"></div>
 </main>
-<dialog id="viewer"><div class="dialog-bar"><span id="viewerName"></span><div class="toolbar"><button id="compare">看调色版</button><button id="close">关闭</button></div></div><img id="viewerImage" alt=""></dialog>
+<dialog id="viewer">
+  <div class="dialog-bar"><span id="viewerName"></span><button id="close">关闭</button></div>
+  <div class="toolbar" aria-label="照片查看工具">
+    <button id="prevPhoto" title="上一张（←）" aria-label="同组上一张">←</button>
+    <span id="viewerPosition"></span>
+    <button id="nextPhoto" title="下一张（→）" aria-label="同组下一张">→</button>
+    <button id="compareGrade" aria-keyshortcuts="C">看调色版 (C)</button>
+    <button id="showMasks" aria-pressed="false">蒙版</button>
+    <button id="gradeAdvice">使用 hy4 建议</button>
+    <button id="zoomOut" aria-label="缩小">−</button>
+    <button id="zoomReset" aria-label="恢复适屏">适屏</button>
+    <button id="zoomIn" aria-label="放大">+</button>
+  </div>
+  <div id="viewerStage" class="viewer-stage" tabindex="0" aria-label="滚轮或加减键缩放，拖动查看，按 0 适屏">
+    <div class="viewer-canvas"><img id="viewerImage" alt="" draggable="false"></div>
+  </div>
+  <div id="viewerStatus" role="status"></div>
+  <form id="gradeKeyForm" hidden>
+    <label>TokenLink API Key <input type="password" id="gradeKey" autocomplete="off" placeholder="已配置环境变量时可留空"></label>
+    <button type="submit">发送当前照片缩略图并获取建议</button>
+  </form>
+</dialog>
 <dialog id="importDialog">
 <form id="importForm">
 <h2 id="importTitle">新建批次</h2>
@@ -104,15 +139,24 @@ let project;
 let token;
 let activeBatch;
 let resumeBatch;
+let rescoreBatch = false;
+let refineBatch = false;
 let folderParent = "";
 let refreshVersion = 0;
-const phases = {queued:"等待处理",scanning:"正在扫描和去重",grouping:"正在分组",scoring:"hy4 正在评分",
+const phases = {queued:"等待处理",scanning:"正在扫描和去重",grouping:"正在分组",refining:"hy4 正在复核分组",scoring:"hy4 正在评分",
                 complete:"处理完成",error:"处理未完成",interrupted:"处理已中断，可续跑"};
-const running = new Set(["queued","scanning","grouping","scoring"]);
+const running = new Set(["queued","scanning","grouping","refining","scoring"]);
 let changed = {};
 let dirty = false;
-let viewerSource;
-let adjustedPreview = false;
+let viewerPhoto;
+let viewerBatch;
+let viewerGroup = [];
+let viewerView = "original";
+let compareView = "original";
+let viewerRequest = 0;
+let imageUrl = "";
+let zoom = 1;
+let drag;
 let refreshTimer;
 const status = message => { byId("status").textContent = message; };
 function element(tag, text, className) {
@@ -122,13 +166,38 @@ function element(tag, text, className) {
   return node;
 }
 function allPhotos() { return project.groups.flatMap(group => group.photos); }
-function counts() {
+const photoNameOrder = new Intl.Collator("zh-CN", {numeric:true, sensitivity:"base"});
+function byCapture(left, right) {
+  return (left.captured || "9999").localeCompare(right.captured || "9999") ||
+    photoNameOrder.compare(left.name, right.name) || left.id.localeCompare(right.id);
+}
+function captureGroups(groups, mergedIds) {
+  const days = new Map();
+  for (const group of groups) {
+    for (const photo of group.photos) {
+      const day = photo.captured?.slice(0, 10) || "";
+      const groupId = mergedIds?.[photo.id] ?? group.id;
+      if (!days.has(day)) days.set(day, new Map());
+      const groupsOnDay = days.get(day);
+      if (!groupsOnDay.has(groupId)) groupsOnDay.set(groupId, []);
+      groupsOnDay.get(groupId).push(photo);
+    }
+  }
+  return Array.from(days, ([day, groupsOnDay]) => ({
+    day,
+    groups: Array.from(groupsOnDay, ([id, photos]) => ({id, photos: photos.sort(byCapture)}))
+      .sort((left, right) => byCapture(left.photos[0], right.photos[0]))
+  })).sort((left, right) => (left.day || "9999").localeCompare(right.day || "9999"));
+}
+function counts(groupCount = byId("groupBy").value === "date"
+  ? captureGroups(project.groups, project.review_group_ids).reduce((total, day) => total + day.groups.length, 0)
+  : project.groups.length) {
   const photos = allPhotos();
   byId("counts").textContent = project.input_count + " 个文件 · " + photos.length + " 张去重后照片 · " +
-    project.groups.length + " 组 · " + photos.filter(photo => photo.rating).length + " 张已评分 · " +
+    groupCount + " 组 · " + photos.filter(photo => photo.rating).length + " 张已评分 · " +
     photos.filter(photo => photo.selected).length + " 张已勾选";
 }
-function show(photo) {
+function show(photo, rank = null, groupPhotos = null) {
   const src = "/preview/" + photo.id + ".jpg";
   const card = element("article");
   card.dataset.selected = photo.selected;
@@ -141,13 +210,11 @@ function show(photo) {
   img.loading = "lazy";
   preview.append(img);
   preview.onclick = () => {
-    viewerSource = src;
-    adjustedPreview = false;
-    byId("compare").textContent = "看调色版";
-    byId("viewerImage").src = src;
-    byId("viewerImage").alt = photo.name;
-    byId("viewerName").textContent = photo.name;
+    viewerBatch = activeBatch;
+    viewerGroup = groupPhotos || project.groups.find(group => group.photos.some(item => item.id === photo.id))?.photos || [photo];
     byId("viewer").showModal();
+    openViewerPhoto(photo);
+    byId("viewerStage").focus();
   };
   const meta = element("div", undefined, "meta");
   const row = element("div", undefined, "meta-top");
@@ -155,6 +222,7 @@ function show(photo) {
   const box = element("input");
   box.type = "checkbox";
   box.checked = photo.selected;
+  box.disabled = photo.blurred;
   box.onchange = () => {
     photo.selected = box.checked;
     changed[photo.id] = box.checked;
@@ -165,11 +233,15 @@ function show(photo) {
   };
   label.append(box, document.createTextNode(photo.name));
   row.append(label);
-  if (photo.rating) row.append(element("span", photo.rating.total.toFixed(1), "total"));
+  if (photo.rating) row.append(element("span", photo.rating.total.toFixed(rank ? 2 : 1), "total"));
   meta.append(row);
+  if (photo.captured) meta.append(element("p", photo.captured.replace("T", " "), "muted"));
+  if (rank) meta.append(element("p", "第 " + rank.position + " 名 · 第 " + rank.groupId + " 组", "muted"));
   const rating = photo.rating;
   if (rating) {
-    meta.append(element("p", decisions[rating.decision] + (rating.technical_issue ? " · 有技术缺陷" : ""), "tag"),
+    const decision = photo.blurred ? "人工标记模糊" :
+      rating.technical_issue ? "有技术缺陷 · 请复核" : decisions[rating.decision];
+    meta.append(element("p", decision, "tag"),
                 element("p", rating.reason));
     const details = element("details", undefined, "details");
     details.append(element("summary", "查看五项评分"));
@@ -182,31 +254,94 @@ function show(photo) {
     details.append(list);
     meta.append(details);
   } else meta.append(element("p", photo.filtered ? "模型未评分 · 请人工审核" : "待 hy4 评分", "muted"));
+  const blurButton = element("button", photo.blurred ? "撤销模糊标记" : "标记模糊", "details");
+  blurButton.type = "button";
+  blurButton.onclick = () => act(blurButton, async () => {
+    const id = activeBatch;
+    await post("/api/blur", {photo: photo.id, blurred: !photo.blurred}, id);
+    if (id !== activeBatch) return;
+    await refresh();
+    status(photo.blurred ? "已撤销模糊标记。" : "已标记模糊，并从高分榜和导出勾选中移除。");
+  });
+  meta.append(blurButton);
   if (photo.duplicates.length) meta.append(element("p", "重复副本：" + photo.duplicates.join("、"), "details"));
   card.append(preview, meta);
   return card;
 }
+function renderRanking(root, groups) {
+  const ranked = groups.flatMap(group => group.photos
+    .filter(photo => Number.isFinite(photo.rating?.total) && !photo.blurred &&
+      !photo.rating.technical_issue && photo.rating.expression !== "closed_eyes")
+    .map(photo => ({photo, group})));
+  ranked.sort((a, b) => b.photo.rating.total - a.photo.rating.total);
+  if (!ranked.length) {
+    root.append(element("p", "当前批次还没有已评分的照片。", "muted"));
+    return;
+  }
+
+  const limit = byId("rankLimit").value;
+  const visible = limit === "all" ? ranked : ranked.slice(0, Number(limit));
+  const head = element("div", undefined, "group-head");
+  head.append(element("h2", "综合分排行榜"),
+              element("small", "显示 " + visible.length + " / " + ranked.length + " 张"));
+  const cards = element("div", undefined, "cards");
+  let position = 1;
+  for (const [index, entry] of visible.entries()) {
+    if (index > 0 && entry.photo.rating.total !== visible[index - 1].photo.rating.total) {
+      position = index + 1;
+    }
+    cards.append(show(entry.photo, {position, groupId: entry.group.number}, entry.group.photos));
+  }
+  root.append(head, cards);
+}
 function render() {
-  counts();
+  const byDate = byId("groupBy").value === "date";
+  const days = byDate ? captureGroups(project.groups, project.review_group_ids) : [{groups: project.groups}];
+  let number = 0;
+  for (const day of days) {
+    day.groups = day.groups.map(group => ({...group, number: ++number}));
+  }
+  counts(number);
   const root = byId("groups");
   root.replaceChildren();
   const filter = byId("filter").value;
+  byId("rankOptions").hidden = filter !== "ranking";
+  byId("groupOptions").hidden = filter === "ranking";
+  if (filter === "ranking") {
+    renderRanking(root, days.flatMap(day => day.groups));
+    return;
+  }
   const match = {
     all: () => true, selected: photo => photo.selected, maybe: photo => photo.rating?.decision === "maybe",
-    duplicate: photo => photo.duplicates.length, pending: photo => !photo.rating
+    duplicate: photo => photo.duplicates.length, pending: photo => !photo.rating,
+    blurred: photo => photo.blurred
   }[filter];
-  for (const group of project.groups) {
-    const photos = group.photos.filter(match);
-    if (!photos.length) continue;
-    const section = element("section");
-    const head = element("div", undefined, "group-head");
-    head.append(element("h2", "第 " + group.id + " 组"), element("small", group.photos.length + " 张"));
-    const cards = element("div", undefined, "cards");
-    cards.append(...photos.map(show));
-    section.append(head, cards);
-    root.append(section);
+  if (byDate) {
+    for (const {day, groups} of days) {
+      const children = groups.map(group => renderPhotoGroup(group, match, true)).filter(Boolean);
+      if (!children.length) continue;
+      const section = element("section", undefined, "capture-day");
+      section.append(element("h2", day || "拍摄时间未知"), ...children);
+      root.append(section);
+    }
+  } else {
+    for (const group of days[0].groups) {
+      const section = renderPhotoGroup(group, match, false);
+      if (section) root.append(section);
+    }
   }
   if (!root.children.length) root.append(element("p", "没有符合当前筛选条件的照片。", "muted"));
+}
+function renderPhotoGroup(group, match, nested) {
+  const photos = group.photos.filter(match);
+  if (!photos.length) return null;
+  const section = element("section", undefined, "similar-group");
+  const head = element("div", undefined, "group-head");
+  head.append(element(nested ? "h3" : "h2", "第 " + group.number + " 组"), element("small", photos.length + " 张"));
+  const cards = element("div", undefined, "cards");
+  cards.append(...photos.map(photo => show(photo, null, group.photos)));
+  section.append(head, cards);
+  return section;
 }
 function showProgress(updated) {
   const progress = updated.progress;
@@ -220,6 +355,8 @@ function showProgress(updated) {
     meter.value = done;
   } else meter.removeAttribute("value");
   byId("resume").hidden = !["error", "interrupted"].includes(phase);
+  byId("rescore").hidden = running.has(phase) || !updated.groups.length;
+  byId("refineGroups").hidden = running.has(phase) || !updated.groups.length;
 }
 async function refresh(quiet = false) {
   clearTimeout(refreshTimer);
@@ -234,14 +371,15 @@ async function refresh(quiet = false) {
     showProgress(updated);
     const active = running.has(updated.progress.phase);
     const photoState = state => JSON.stringify(state.groups.map(group =>
-      group.photos.map(photo => [photo.id, !!photo.rating, !!photo.filtered])));
+      group.photos.map(photo => [photo.id, state.review_group_ids?.[photo.id] ?? group.id,
+        photo.captured, photo.rating, !!photo.filtered, !!photo.blurred])));
     const redraw = !project || photoState(project) !== photoState(updated);
     const interacting = byId("viewer").open || byId("groups").contains(document.activeElement);
     if (active || (quiet && redraw && interacting)) refreshTimer = setTimeout(() => refresh(true), 2500);
     if (quiet && (!redraw || interacting)) return;
     project = updated;
     for (const photo of allPhotos()) {
-      if (Object.hasOwn(changed, photo.id)) photo.selected = changed[photo.id];
+      if (!photo.blurred && Object.hasOwn(changed, photo.id)) photo.selected = changed[photo.id];
     }
     byId("source").textContent = updated.source || updated.progress.source || "";
     render();
@@ -285,6 +423,7 @@ async function switchBatch(id) {
   byId("job").textContent = "";
   byId("jobProgress").hidden = true;
   byId("resume").hidden = true;
+  byId("refineGroups").hidden = true;
   localStorage.setItem("photo-review-batch", id);
   byId("groups").replaceChildren();
   await refresh();
@@ -309,10 +448,12 @@ async function browseSafely(path) {
   try { await browse(path); }
   catch (error) { byId("importError").textContent = error.message; }
 }
-function openImport(batch) {
+function openImport(batch, rescore = false, refine = false) {
   resumeBatch = batch;
-  byId("importTitle").textContent = batch ? "续跑当前批次" : "新建批次";
-  byId("start").textContent = batch ? "继续处理" : "开始去重、分组和评分";
+  rescoreBatch = rescore;
+  refineBatch = refine;
+  byId("importTitle").textContent = refine ? "hy4 优化分组" : rescore ? "按新分组重评" : batch ? "续跑当前批次" : "新建批次";
+  byId("start").textContent = refine ? "发送候选缩略图并复核" : rescore ? "开始重评" : batch ? "继续处理" : "开始去重、分组和评分";
   byId("folderPicker").hidden = !!batch;
   byId("importError").textContent = "";
   byId("importDialog").showModal();
@@ -320,6 +461,8 @@ function openImport(batch) {
 }
 byId("newBatch").onclick = () => openImport(null);
 byId("resume").onclick = () => openImport(activeBatch);
+byId("rescore").onclick = () => openImport(activeBatch, true);
+byId("refineGroups").onclick = () => openImport(activeBatch, false, true);
 byId("browse").onclick = () => browseSafely(byId("folderPath").value.trim());
 byId("up").onclick = () => browseSafely(folderParent);
 byId("cancelImport").onclick = () => byId("importDialog").close();
@@ -340,7 +483,8 @@ byId("importForm").onsubmit = async event => {
       dirty = false;
     }
     const result = await post("/api/batches", {
-      source: byId("folderPath").value.trim(), batch: resumeBatch, key: byId("apiKey").value
+      source: byId("folderPath").value.trim(), batch: resumeBatch, key: byId("apiKey").value,
+      rescore: rescoreBatch, refine_groups: refineBatch
     });
     byId("apiKey").value = "";
     await loadBatches();
@@ -366,11 +510,203 @@ async function act(button, operation) {
   finally { button.disabled = false; }
 }
 byId("filter").onchange = () => { if (project) render(); };
+byId("rankLimit").onchange = () => { if (project) render(); };
+byId("groupBy").onchange = () => { if (project) render(); };
 byId("refresh").onclick = () => refresh();
-byId("compare").onclick = () => {
-  adjustedPreview = !adjustedPreview;
-  byId("viewerImage").src = viewerSource + (adjustedPreview ? "?adjusted=1" : "");
-  byId("compare").textContent = adjustedPreview ? "看原图" : "看调色版";
+function layoutViewer() {
+  if (!viewerPhoto || !byId("viewer").open) return;
+  const stage = byId("viewerStage");
+  const width = viewerPhoto.width || byId("viewerImage").naturalWidth || 1;
+  const height = viewerPhoto.height || byId("viewerImage").naturalHeight || 1;
+  const fit = Math.min(stage.clientWidth / width, stage.clientHeight / height);
+  byId("viewerImage").style.width = width * fit * zoom + "px";
+  byId("viewerImage").style.height = height * fit * zoom + "px";
+  stage.toggleAttribute("data-zoomed", zoom > 1);
+  byId("zoomReset").textContent = zoom === 1 ? "适屏" : Math.round(zoom * 100) + "%（相对适屏）";
+}
+new ResizeObserver(layoutViewer).observe(byId("viewerStage"));
+async function loadViewerImage(force = false) {
+  const view = viewerView;
+  const source = "/preview/" + viewerPhoto.id + ".jpg";
+  const query = new URLSearchParams({view, batch:viewerBatch || "legacy"});
+  if (zoom > 1) query.set("full", "1");
+  const url = view === "original" && zoom === 1 ? source : source + "?" + query;
+  if (!force && imageUrl === url) return;
+  const request = ++viewerRequest;
+  imageUrl = url;
+  byId("viewerStatus").textContent = "正在加载…";
+  try {
+    const response = await fetch(url);
+    if (!response.ok) {
+      const message = response.headers.get("Content-Type")?.includes("application/json") ?
+        (await response.json()).error : "读取照片失败";
+      throw Error(message);
+    }
+    const blob = await response.blob();
+    if (request !== viewerRequest || !byId("viewer").open) return;
+    const image = byId("viewerImage");
+    if (image.src.startsWith("blob:")) URL.revokeObjectURL(image.src);
+    image.src = URL.createObjectURL(blob);
+    byId("viewerStatus").textContent = view === "masks" ? "橙色为人脸，蓝色为天空。" : "";
+  } catch (error) {
+    if (request !== viewerRequest) return;
+    imageUrl = "";
+    byId("viewerStatus").textContent = error.message;
+  }
+}
+function changeZoom(value, x, y) {
+  const stage = byId("viewerStage");
+  const image = byId("viewerImage");
+  const old = image.getBoundingClientRect();
+  const bounds = stage.getBoundingClientRect();
+  x ??= bounds.left + stage.clientWidth / 2;
+  y ??= bounds.top + stage.clientHeight / 2;
+  const relativeX = Math.max(0, Math.min(1, (x - old.left) / (old.width || 1)));
+  const relativeY = Math.max(0, Math.min(1, (y - old.top) / (old.height || 1)));
+  zoom = Math.max(1, Math.min(12, value));
+  layoutViewer();
+  const next = image.getBoundingClientRect();
+  stage.scrollLeft += next.left + relativeX * next.width - x;
+  stage.scrollTop += next.top + relativeY * next.height - y;
+  if (zoom === 1) stage.scrollTo(0, 0);
+  loadViewerImage();
+}
+const viewerStage = byId("viewerStage");
+function openViewerPhoto(photo) {
+  viewerRequest++;
+  viewerPhoto = photo;
+  const image = byId("viewerImage");
+  if (image.src.startsWith("blob:")) URL.revokeObjectURL(image.src);
+  image.src = "/preview/" + photo.id + ".jpg";
+  image.alt = photo.name;
+  imageUrl = "";
+  zoom = 1;
+  const index = viewerGroup.findIndex(item => item.id === photo.id);
+  byId("viewerName").textContent = photo.name;
+  byId("viewerPosition").textContent = (index + 1) + " / " + viewerGroup.length;
+  byId("prevPhoto").disabled = index <= 0;
+  byId("nextPhoto").disabled = index >= viewerGroup.length - 1;
+  byId("viewerStatus").textContent = "";
+  byId("gradeKeyForm").hidden = true;
+  byId("gradeKey").value = "";
+  layoutViewer();
+  viewerStage.scrollTo(0, 0);
+  setViewerView("original");
+  updateAdviceButton();
+}
+function moveViewerPhoto(step) {
+  const index = viewerGroup.findIndex(item => item.id === viewerPhoto.id);
+  const next = viewerGroup[index + step];
+  if (next) openViewerPhoto(next);
+}
+function setViewerView(view) {
+  viewerView = view;
+  if (view !== "masks") compareView = view;
+  byId("compareGrade").textContent = compareView === "original" ? "看调色版 (C)" : "看原图 (C)";
+  byId("showMasks").setAttribute("aria-pressed", view === "masks");
+  loadViewerImage();
+}
+function toggleCompare() {
+  setViewerView(compareView === "original" ? "adjusted" : "original");
+}
+byId("prevPhoto").onclick = () => moveViewerPhoto(-1);
+byId("nextPhoto").onclick = () => moveViewerPhoto(1);
+byId("compareGrade").onclick = toggleCompare;
+byId("showMasks").onclick = () => setViewerView(viewerView === "masks" ? compareView : "masks");
+viewerStage.addEventListener("wheel", event => {
+  if (!event.deltaY) return;
+  event.preventDefault();
+  changeZoom(zoom * (event.deltaY < 0 ? 1.2 : 1 / 1.2), event.clientX, event.clientY);
+}, {passive:false});
+viewerStage.onpointerdown = event => {
+  if (event.button !== 0 || event.target !== byId("viewerImage")) return;
+  if (zoom === 1) {
+    changeZoom(2, event.clientX, event.clientY);
+    return;
+  }
+  drag = {id:event.pointerId, x:event.clientX, y:event.clientY,
+          left:viewerStage.scrollLeft, top:viewerStage.scrollTop};
+  viewerStage.setPointerCapture(event.pointerId);
+  viewerStage.toggleAttribute("data-dragging", true);
+};
+viewerStage.onpointermove = event => {
+  if (drag?.id !== event.pointerId) return;
+  viewerStage.scrollLeft = drag.left + drag.x - event.clientX;
+  viewerStage.scrollTop = drag.top + drag.y - event.clientY;
+};
+viewerStage.onlostpointercapture = () => {
+  drag = null;
+  viewerStage.removeAttribute("data-dragging");
+};
+byId("viewer").addEventListener("keydown", event => {
+  if (event.target.matches("input,select,textarea") || event.ctrlKey || event.altKey || event.metaKey) return;
+  if (event.key === "ArrowLeft" || event.key === "ArrowRight") {
+    event.preventDefault();
+    moveViewerPhoto(event.key === "ArrowLeft" ? -1 : 1);
+    return;
+  }
+  if (event.key.toLowerCase() === "c") {
+    event.preventDefault();
+    if (!event.repeat) toggleCompare();
+    return;
+  }
+  if (!["+", "=", "-", "−", "0"].includes(event.key)) return;
+  event.preventDefault();
+  changeZoom(event.key === "0" ? 1 : zoom * (["+", "="].includes(event.key) ? 1.25 : 0.8));
+});
+window.addEventListener("resize", layoutViewer);
+byId("zoomIn").onclick = () => changeZoom(zoom * 1.25);
+byId("zoomOut").onclick = () => changeZoom(zoom * 0.8);
+byId("zoomReset").onclick = () => changeZoom(1);
+byId("viewer").addEventListener("close", () => {
+  viewerRequest++;
+  const image = byId("viewerImage");
+  if (image.src.startsWith("blob:")) URL.revokeObjectURL(image.src);
+  image.removeAttribute("src");
+  byId("gradeKey").value = "";
+});
+function updateAdviceButton() {
+  const enabled = project.grade_advice?.includes(viewerPhoto.id);
+  byId("gradeAdvice").textContent = enabled ? "恢复本地调色" : "使用 hy4 建议";
+}
+async function changeAdvice(reset) {
+  const photo = viewerPhoto.id;
+  const batch = viewerBatch;
+  const key = byId("gradeKey").value;
+  byId("gradeKey").value = "";
+  const button = byId("gradeAdvice");
+  const submit = byId("gradeKeyForm").querySelector("button");
+  button.disabled = submit.disabled = true;
+  byId("viewerStatus").textContent = reset ? "正在恢复本地调色…" : "正在获取 hy4 建议…";
+  try {
+    await post("/api/grade-advice", {photo, key, reset}, batch);
+    if (batch === activeBatch) {
+      project.grade_advice = (project.grade_advice || []).filter(id => id !== photo);
+      if (!reset) project.grade_advice.push(photo);
+    }
+    if (!byId("viewer").open || photo !== viewerPhoto.id || batch !== viewerBatch) return;
+    byId("gradeKeyForm").hidden = true;
+    updateAdviceButton();
+    setViewerView("adjusted");
+    loadViewerImage(true);
+  } catch (error) {
+    if (byId("viewer").open && photo === viewerPhoto.id && batch === viewerBatch)
+      byId("viewerStatus").textContent = error.message;
+  } finally {
+    button.disabled = submit.disabled = false;
+  }
+}
+byId("gradeAdvice").onclick = () => {
+  if (project.grade_advice?.includes(viewerPhoto.id)) changeAdvice(true);
+  else {
+    const form = byId("gradeKeyForm");
+    form.hidden = !form.hidden;
+    if (!form.hidden) byId("gradeKey").focus();
+  }
+};
+byId("gradeKeyForm").onsubmit = event => {
+  event.preventDefault();
+  changeAdvice(false);
 };
 byId("close").onclick = () => byId("viewer").close();
 byId("save").onclick = () => act(byId("save"), async () => {

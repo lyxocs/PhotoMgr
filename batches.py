@@ -7,7 +7,7 @@ from pathlib import Path
 from threading import Lock
 from uuid import uuid4
 
-from photo_review import DATA, load_json, scan, score, write_json
+from photo_review import DATA, load_json, refine_scene_groups, review_scoring_project, scan, score, write_json
 
 BATCHES = DATA / "batches"
 ACTIVE = {}
@@ -42,12 +42,29 @@ def list_batches():
 def batch_status(batch_id, data):
     with LOCK:
         state = load_json(data / "batch.json", {})
-        if state.get("phase") in {"queued", "scanning", "grouping", "scoring"} and batch_id not in ACTIVE:
+        if (state.get("phase") in {"queued", "scanning", "grouping", "refining", "scoring"}
+                and batch_id not in ACTIVE and not external_worker_running(data)):
             state["phase"] = "interrupted"
         return state
 
 
-def run_batch(batch_id, data, state, key):
+def external_worker_running(data):
+    pid = load_json(data / "rescore" / "worker.json", {}).get("pid")
+    if not isinstance(pid, int) or pid <= 0:
+        return False
+    import ctypes
+
+    kernel = ctypes.windll.kernel32
+    handle = kernel.OpenProcess(0x100000, False, pid)
+    if not handle:
+        return False
+    try:
+        return kernel.WaitForSingleObject(handle, 0) == 258
+    finally:
+        kernel.CloseHandle(handle)
+
+
+def run_batch(batch_id, data, state, key, *, workers=4):
     def progress(phase, done, total, message=""):
         state.update(phase=phase, done=done, total=total, message=message)
         write_json(data / "batch.json", state)
@@ -61,9 +78,25 @@ def run_batch(batch_id, data, state, key):
                 raise ValueError("找不到源文件夹，请检查磁盘是否已连接")
             project = scan(source, data, progress)
         if project["groups"]:
-            failures = score(project, key, data, progress)
+            if state.get("refine_groups"):
+                from review import project_state
+
+                requests, merged = refine_scene_groups(project_state(batch_id), data, key, progress)
+                message = f"hy4 复核 {requests} 批候选，合并 {merged} 处"
+                state.pop("refine_groups", None)
+                return
+            scoring_data = data
+            if state.get("rescore"):
+                from review import project_state
+
+                project = review_scoring_project(project_state(batch_id), data)
+                scoring_data = data / "rescore"
+                scoring_data.mkdir(exist_ok=True)
+            failures = score(project, key, scoring_data, progress, workers=workers)
             if failures:
                 phase, message = "error", f"{failures} 个评分任务失败，可续跑"
+            elif state.get("rescore"):
+                write_json(scoring_data / "published.json", project)
         else:
             phase, message = "error", "没有可读取的 JPG/JPEG 照片"
     except Exception:
@@ -99,12 +132,17 @@ def enqueue(payload):
             state = {"source": str(source), "created": datetime.now().isoformat(timespec="seconds")}
         else:
             data = batch_data(batch_id)
-            if batch_id in ACTIVE:
-                return batch_id
             state = load_json(data / "batch.json", {})
+            if batch_id in ACTIVE or external_worker_running(data):
+                return batch_id
             if batch_id == LEGACY and "source" not in state:
                 project = load_json(data / "project.json", {})
                 state["source"] = project["source"]
+            if payload.get("rescore") is True:
+                state["rescore"] = True
+                state.pop("refine_groups", None)
+            if payload.get("refine_groups") is True:
+                state["refine_groups"] = True
         state.update(phase="queued", done=0, total=0, message="")
         write_json(data / "batch.json", state)
         ACTIVE[batch_id] = QUEUE.submit(run_batch, batch_id, data, state, key.strip())
