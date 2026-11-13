@@ -352,13 +352,42 @@ def export_photo(photo, mode, destination, relative=None):
         raise
 
 
+def relocate(data, source):
+    if not source.is_dir():
+        raise ValueError("New photo folder does not exist")
+    project_path = data / "project.json"
+    project = load_json(project_path, None)
+    batch_path = data / "batch.json"
+    batch = load_json(batch_path, None)
+    if project is None and batch is None:
+        raise ValueError("No saved batch found")
+    if project is not None:
+        previous = Path(project["source"])
+        for group in project["groups"]:
+            for photo in group["photos"]:
+                for item in (photo, *photo["duplicates"]):
+                    replacement = source / Path(item["file"]).relative_to(previous)
+                    if not replacement.is_file():
+                        raise ValueError(f"Photo missing in the new folder: {replacement}")
+                    item["file"] = str(replacement)
+        for error in project["errors"]:
+            error["file"] = str(source / Path(error["file"]).relative_to(previous))
+        project["source"] = str(source)
+        write_json(project_path, project)
+    if batch is not None:
+        batch["source"] = str(source)
+        write_json(batch_path, batch)
+
+
 def main():
     parser = argparse.ArgumentParser()
-    parser.add_argument("action", choices=["scan", "score", "serve"])
-    parser.add_argument("--source", type=Path, default=ROOT.parent / "越野跑")
+    parser.add_argument("action", choices=["scan", "score", "serve", "list-batches", "relocate"])
+    parser.add_argument("--source", type=Path)
+    parser.add_argument("--batch", default="legacy")
     parser.add_argument("--port", type=int, default=8765)
     args = parser.parse_args()
     if args.action == "scan":
+        args.source = args.source or ROOT.parent / "越野跑"
         if not args.source.is_dir():
             parser.error("Source directory does not exist")
         scan(args.source.resolve())
@@ -371,6 +400,19 @@ def main():
         if not key.strip() or project is None:
             parser.error("Scan the source folder first and provide a TokenLink API key")
         raise SystemExit(bool(score(project, key.strip())))
+    elif args.action == "list-batches":
+        from batches import list_batches
+        for batch in list_batches():
+            print(batch["id"], batch["source"])
+    elif args.action == "relocate":
+        from batches import batch_data
+        if args.source is None:
+            parser.error("relocate requires --source")
+        try:
+            relocate(batch_data(args.batch), args.source.resolve())
+        except (OSError, ValueError) as exc:
+            parser.error(str(exc))
+        print(f"Photo folder updated: {args.source.resolve()}")
     else:
         from review import serve
         serve(args.port)

@@ -85,7 +85,7 @@ dialog img{display:block;object-fit:contain;max-width:90vw;max-height:82vh}
 <form id="importForm">
 <h2 id="importTitle">新建批次</h2>
 <div id="folderPicker">
-<label>照片文件夹 <input type="text" id="folderPath" placeholder="F:&#92;photo&#92;照片文件夹"></label>
+<label>照片文件夹 <input type="text" id="folderPath" placeholder="粘贴完整路径，或从磁盘浏览"></label>
 <div class="toolbar"><button id="browse" type="button">浏览文件夹</button><button id="up" type="button" hidden>上一级</button></div>
 <div id="folders" aria-label="子文件夹"></div>
 <small>会扫描所选文件夹及其子文件夹中的所有 JPG/JPEG。</small>
@@ -316,7 +316,7 @@ function openImport(batch) {
   byId("folderPicker").hidden = !!batch;
   byId("importError").textContent = "";
   byId("importDialog").showModal();
-  if (!batch && !byId("folderPath").value) browseSafely(project?.source || "F:\\photo");
+  if (!batch && !byId("folderPath").value) browseSafely("");
 }
 byId("newBatch").onclick = () => openImport(null);
 byId("resume").onclick = () => openImport(activeBatch);
