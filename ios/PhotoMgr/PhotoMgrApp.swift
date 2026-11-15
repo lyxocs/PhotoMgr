@@ -3,6 +3,7 @@ import ImageIO
 import Photos
 import SwiftUI
 import UIKit
+import Vision
 
 @main
 @MainActor
@@ -130,6 +131,113 @@ private final class LibraryScanner {
     }
 }
 
+private enum PhotoRanker {
+    static func recommend(
+        in groups: [PhotoGroup],
+        progress: @escaping (Int) -> Void,
+        completion: @escaping ([String: String]) -> Void
+    ) {
+        DispatchQueue.global(qos: .userInitiated).async {
+            let options = PHImageRequestOptions()
+            options.isSynchronous = true
+            options.deliveryMode = .highQualityFormat
+            options.isNetworkAccessAllowed = false
+            var winners: [String: String] = [:]
+            for (index, group) in groups.enumerated() {
+                var best: (id: String, score: Double)?
+                var scored = 0
+                for asset in group.assets {
+                    autoreleasepool {
+                        PHImageManager.default().requestImage(
+                            for: asset, targetSize: CGSize(width: 768, height: 768),
+                            contentMode: .aspectFit, options: options
+                        ) { image, _ in
+                            guard let image = image?.cgImage, let score = Self.score(image) else { return }
+                            scored += 1
+                            if best.map({ score > $0.score }) ?? true {
+                                best = (asset.localIdentifier, score)
+                            }
+                        }
+                    }
+                }
+                if let best, scored == group.assets.count { winners[group.id] = best.id }
+                if index % 10 == 9 || index + 1 == groups.count { progress(index + 1) }
+            }
+            completion(winners)
+        }
+    }
+
+    private static func score(_ image: CGImage) -> Double? {
+        let size = 96
+        var pixels = [UInt8](repeating: 0, count: size * size)
+        let drawn = pixels.withUnsafeMutableBytes { storage -> Bool in
+            guard let context = CGContext(
+                data: storage.baseAddress, width: size, height: size, bitsPerComponent: 8,
+                bytesPerRow: size, space: CGColorSpaceCreateDeviceGray(),
+                bitmapInfo: CGImageAlphaInfo.none.rawValue
+            ) else { return false }
+            context.interpolationQuality = .medium
+            context.draw(image, in: CGRect(x: 0, y: 0, width: size, height: size))
+            return true
+        }
+        guard drawn else { return nil }
+
+        var energy = 0.0
+        for row in 1..<(size - 1) {
+            for col in 1..<(size - 1) {
+                let i = row * size + col
+                let neighbors = Int(pixels[i - 1]) + Int(pixels[i + 1])
+                    + Int(pixels[i - size]) + Int(pixels[i + size])
+                let gradient = Double(4 * Int(pixels[i]) - neighbors)
+                energy += gradient * gradient
+            }
+        }
+        let sharpness = min(1, log1p(energy / Double((size - 2) * (size - 2))) / 9)
+        let mean = Double(pixels.reduce(0) { $0 + Int($1) }) / Double(pixels.count) / 255
+        let clipped = Double(pixels.filter { $0 <= 6 || $0 >= 249 }.count) / Double(pixels.count)
+        let exposurePenalty = clipped + max(0, abs(mean - 0.5) - 0.17)
+        return 0.65 * sharpness - 0.65 * exposurePenalty - closedEyePenalty(in: image)
+    }
+
+    private static func closedEyePenalty(in image: CGImage) -> Double {
+        let request = VNDetectFaceLandmarksRequest()
+        let handler = VNImageRequestHandler(cgImage: image, options: [:])
+        guard (try? handler.perform([request])) != nil else { return 0 }
+        for face in request.results ?? [] {
+            let width = face.boundingBox.width * CGFloat(image.width)
+            let height = face.boundingBox.height * CGFloat(image.height)
+            guard face.confidence >= 0.6, width >= 55, height >= 55,
+                  let left = eyeOpenness(face.landmarks?.leftEye, width: width, height: height),
+                  let right = eyeOpenness(face.landmarks?.rightEye, width: width, height: height)
+            else { continue }
+            if max(left, right) < 0.17 { return 0.35 }
+        }
+        return 0
+    }
+
+    private static func eyeOpenness(_ eye: VNFaceLandmarkRegion2D?, width: CGFloat, height: CGFloat) -> CGFloat? {
+        guard let points = eye?.normalizedPoints, points.count >= 4 else { return nil }
+        let scaled = points.map { CGPoint(x: $0.x * width, y: $0.y * height) }
+        var axis = CGPoint.zero
+        var diameter: CGFloat = 0
+        for (index, point) in scaled.enumerated() {
+            for other in scaled.dropFirst(index + 1) {
+                let dx = other.x - point.x
+                let dy = other.y - point.y
+                let distance = hypot(dx, dy)
+                if distance > diameter {
+                    diameter = distance
+                    axis = CGPoint(x: dx, y: dy)
+                }
+            }
+        }
+        guard diameter >= 8 else { return nil }
+        let perpendicular = scaled.map { ($0.y * axis.x - $0.x * axis.y) / diameter }
+        guard let low = perpendicular.min(), let high = perpendicular.max() else { return nil }
+        return (high - low) / diameter
+    }
+}
+
 private enum AlbumExporter {
     static let title = "PhotoMgr 调色成片"
     private static let albumKey = "gradedAlbumIdentifier"
@@ -233,12 +341,19 @@ final class LibraryModel: ObservableObject {
     @Published private(set) var progress = 0
     @Published private(set) var total = 0
     @Published private(set) var unavailable = 0
+    @Published private(set) var recommendations = Set(UserDefaults.standard.stringArray(forKey: "recommendedPhotoIDs") ?? [])
+    @Published private(set) var ranking = false
+    @Published private(set) var rankedGroups = 0
+    @Published private(set) var rankingTotal = 0
+    @Published private(set) var rankingMessage = ""
     @Published private(set) var exportTotal = 0
     @Published private(set) var exportDone = 0
     @Published private(set) var exporting = false
     @Published private(set) var exportMessage = ""
 
     private let scanner = LibraryScanner()
+    private var manualIDs = Set(UserDefaults.standard.stringArray(forKey: "manualSelectionIDs")
+                                ?? UserDefaults.standard.stringArray(forKey: "selectedPhotoIDs") ?? [])
     private var loaded = false
     private var availableIDs: Set<String> = []
 
@@ -253,7 +368,7 @@ final class LibraryModel: ObservableObject {
             loaded = false
             return
         }
-        guard !scanning, !exporting, force || !loaded || status != previous else { return }
+        guard !scanning, !exporting, !ranking, force || !loaded || status != previous else { return }
         scanning = true
         progress = 0
         total = 0
@@ -287,8 +402,53 @@ final class LibraryModel: ObservableObject {
 
     var exportCount: Int { selected.intersection(availableIDs).count }
 
+    var canRank: Bool {
+        !scanning && !exporting && !ranking && days.contains { day in
+            day.groups.contains { $0.assets.count > 1 }
+        }
+    }
+
+    func rankGroups() {
+        guard canRank else { return }
+        let groups = days.flatMap(\.groups).filter { $0.assets.count > 1 }
+        ranking = true
+        rankedGroups = 0
+        rankingTotal = groups.count
+        rankingMessage = ""
+        PhotoRanker.recommend(in: groups) { [weak self] done in
+            DispatchQueue.main.async { self?.rankedGroups = done }
+        } completion: { [weak self] winners in
+            DispatchQueue.main.async {
+                guard let self else { return }
+                self.ranking = false
+                guard self.canRead else { return }
+                let accessible = Set(groups.filter { group in
+                    group.assets.allSatisfy { self.availableIDs.contains($0.localIdentifier) }
+                }.map(\.id))
+                let visibleWinners = winners.filter { accessible.contains($0.key) }
+                var updated = self.selected
+                for group in groups {
+                    guard let winner = visibleWinners[group.id] else { continue }
+                    let ids = group.assets.map(\.localIdentifier)
+                    if self.manualIDs.isDisjoint(with: ids) {
+                        updated.subtract(ids)
+                        updated.insert(winner)
+                    }
+                }
+                self.selected = updated
+                self.recommendations = Set(visibleWinners.values)
+                self.saveSelections()
+                UserDefaults.standard.set(self.recommendations.sorted(), forKey: "recommendedPhotoIDs")
+                let missed = groups.count - visibleWinners.count
+                self.rankingMessage = missed == 0
+                    ? "已推荐 \(visibleWinners.count) 组"
+                    : "已推荐 \(visibleWinners.count) 组，\(missed) 组无法读取"
+            }
+        }
+    }
+
     func exportSelected() {
-        guard !exporting, !scanning else { return }
+        guard !exporting, !scanning, !ranking else { return }
         guard PHPhotoLibrary.authorizationStatus(for: .readWrite) == .authorized else {
             exportMessage = "请在设置中为 PhotoMgr 开启照片完整访问，然后重试。"
             return
@@ -319,12 +479,26 @@ final class LibraryModel: ObservableObject {
     }
 
     func setSelected(_ ids: [String], to checked: Bool) {
+        manualIDs.formUnion(ids)
         if checked {
             selected.formUnion(ids)
         } else {
             selected.subtract(ids)
         }
+        saveSelections()
+    }
+
+    func replaceSelection(in group: PhotoGroup, with id: String) {
+        let ids = group.assets.map(\.localIdentifier)
+        manualIDs.formUnion(ids)
+        selected.subtract(ids)
+        selected.insert(id)
+        saveSelections()
+    }
+
+    private func saveSelections() {
         UserDefaults.standard.set(selected.sorted(), forKey: "selectedPhotoIDs")
+        UserDefaults.standard.set(manualIDs.sorted(), forKey: "manualSelectionIDs")
     }
 }
 
@@ -376,7 +550,7 @@ struct LibraryView: View {
                 if model.canRead {
                     ToolbarItem(placement: .topBarTrailing) {
                         Button("重新扫描", systemImage: "arrow.clockwise") { model.refresh(force: true) }
-                            .disabled(model.scanning || model.exporting)
+                            .disabled(model.scanning || model.exporting || model.ranking)
                     }
                 }
             }
@@ -434,6 +608,9 @@ struct LibraryView: View {
             }
             .pickerStyle(.segmented)
             HStack {
+                Button("自动选片", systemImage: "wand.and.stars") { model.rankGroups() }
+                    .buttonStyle(.borderedProminent)
+                    .disabled(!model.canRank)
                 Button { choosingDate = true } label: {
                     Label {
                         if let date {
@@ -491,6 +668,13 @@ struct LibraryView: View {
             }
             .font(.subheadline)
         }
+        if model.ranking {
+            ProgressView(value: Double(model.rankedGroups), total: Double(model.rankingTotal)) {
+                Text("正在自动选片 · \(model.rankedGroups) / \(model.rankingTotal) 组")
+            }
+        } else if !model.rankingMessage.isEmpty {
+            Text(model.rankingMessage).font(.footnote).foregroundStyle(.secondary)
+        }
         if model.scanning {
             if model.total > 0 {
                 ProgressView(value: Double(model.progress), total: Double(model.total)) {
@@ -540,7 +724,7 @@ struct LibraryView: View {
         if model.status == .authorized {
             Button("调色并保存", systemImage: "wand.and.stars") { confirmingExport = true }
                 .buttonStyle(.borderedProminent)
-                .disabled(model.exportCount == 0 || model.scanning || model.exporting)
+                .disabled(model.exportCount == 0 || model.scanning || model.exporting || model.ranking)
                 .accessibilityLabel("自动调色并保存到相册")
         }
     }
@@ -592,7 +776,26 @@ struct LibraryView: View {
                                 .clipShape(RoundedRectangle(cornerRadius: 7))
                         }
                         .buttonStyle(.plain)
-                        .accessibilityLabel("查看照片")
+                        .accessibilityLabel(model.recommendations.contains(asset.localIdentifier)
+                                            ? "查看推荐照片" : "查看照片")
+                        .contextMenu {
+                            if similar && !selectedOnly {
+                                Button("只选组内这张", systemImage: "checkmark.circle") {
+                                    model.replaceSelection(in: group, with: asset.localIdentifier)
+                                }
+                            }
+                        }
+                        .overlay(alignment: .bottomLeading) {
+                            if model.recommendations.contains(asset.localIdentifier) {
+                                Label("推荐", systemImage: "star.fill")
+                                    .font(.caption2.weight(.semibold))
+                                    .padding(4)
+                                    .background(.black.opacity(0.7), in: RoundedRectangle(cornerRadius: 4))
+                                    .foregroundStyle(.white)
+                                    .padding(4)
+                                    .accessibilityHidden(true)
+                            }
+                        }
 
                         Button { model.toggle(asset.localIdentifier) } label: {
                             Image(systemName: checked ? "checkmark.circle.fill" : "circle")
