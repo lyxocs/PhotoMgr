@@ -1,3 +1,5 @@
+import CoreImage
+import ImageIO
 import Photos
 import SwiftUI
 import UIKit
@@ -128,6 +130,100 @@ private final class LibraryScanner {
     }
 }
 
+private enum AlbumExporter {
+    static let title = "PhotoMgr 调色成片"
+    private static let albumKey = "gradedAlbumIdentifier"
+    private static let context = CIContext(options: [.cacheIntermediates: false])
+    private static let toneFilters: Set<String> = [
+        "CIColorControls", "CIVibrance", "CIToneCurve", "CIHighlightShadowAdjust", "CIExposureAdjust"
+    ]
+
+    enum ExportError: Error {
+        case libraryAccess, imageUnavailable, encodingFailed, albumUnavailable
+    }
+
+    static func export(
+        _ assets: [PHAsset],
+        progress: @escaping (Int) -> Void,
+        completion: @escaping (Int, Int) -> Void
+    ) {
+        DispatchQueue.global(qos: .userInitiated).async {
+            var saved = 0
+            for (index, asset) in assets.enumerated() {
+                autoreleasepool {
+                    do {
+                        try save(asset)
+                        saved += 1
+                    } catch {
+                        // Continue the batch when an individual photo cannot be read or saved.
+                    }
+                }
+                progress(index + 1)
+            }
+            completion(saved, assets.count - saved)
+        }
+    }
+
+    private static func save(_ asset: PHAsset) throws {
+        guard PHPhotoLibrary.authorizationStatus(for: .readWrite) == .authorized else {
+            throw ExportError.libraryAccess
+        }
+
+        let options = PHImageRequestOptions()
+        options.isSynchronous = true
+        options.isNetworkAccessAllowed = true
+        options.deliveryMode = .highQualityFormat
+        options.version = .current
+        var image: CIImage?
+        var readError: Error?
+        PHImageManager.default().requestImageDataAndOrientation(for: asset, options: options) {
+            data, _, orientation, info in
+            readError = info?[PHImageErrorKey] as? Error
+            if let data, let decoded = CIImage(data: data) {
+                image = decoded.oriented(orientation)
+            }
+        }
+        guard let image else { throw readError ?? ExportError.imageUnavailable }
+
+        let adjusted = image.autoAdjustmentFilters().reduce(image) { input, filter in
+            guard toneFilters.contains(filter.name) else { return input }
+            filter.setValue(input, forKey: kCIInputImageKey)
+            return filter.outputImage ?? input
+        }
+        let colorSpace = CGColorSpace(name: CGColorSpace.sRGB) ?? CGColorSpaceCreateDeviceRGB()
+        guard let jpeg = context.jpegRepresentation(
+            of: adjusted, colorSpace: colorSpace,
+            options: [CIImageRepresentationOption(rawValue: kCGImageDestinationLossyCompressionQuality as String): 0.94]
+        ) else { throw ExportError.encodingFailed }
+
+        let defaults = UserDefaults.standard
+        let album = defaults.string(forKey: albumKey).flatMap {
+            PHAssetCollection.fetchAssetCollections(withLocalIdentifiers: [$0], options: nil).firstObject
+        }
+        var createdAlbumID: String?
+        var added = false
+        try PHPhotoLibrary.shared().performChangesAndWait {
+            let albumRequest: PHAssetCollectionChangeRequest
+            if let album {
+                guard let request = PHAssetCollectionChangeRequest(for: album) else { return }
+                albumRequest = request
+            } else {
+                albumRequest = .creationRequestForAssetCollection(withTitle: title)
+                createdAlbumID = albumRequest.placeholderForCreatedAssetCollection.localIdentifier
+            }
+
+            let creation = PHAssetCreationRequest.forAsset()
+            creation.creationDate = asset.creationDate
+            creation.addResource(with: .photo, data: jpeg, options: nil)
+            guard let placeholder = creation.placeholderForCreatedAsset else { return }
+            albumRequest.addAssets([placeholder] as NSArray)
+            added = true
+        }
+        guard added else { throw ExportError.albumUnavailable }
+        if let createdAlbumID { defaults.set(createdAlbumID, forKey: albumKey) }
+    }
+}
+
 @MainActor
 final class LibraryModel: ObservableObject {
     @Published private(set) var status = PHPhotoLibrary.authorizationStatus(for: .readWrite)
@@ -137,6 +233,10 @@ final class LibraryModel: ObservableObject {
     @Published private(set) var progress = 0
     @Published private(set) var total = 0
     @Published private(set) var unavailable = 0
+    @Published private(set) var exportTotal = 0
+    @Published private(set) var exportDone = 0
+    @Published private(set) var exporting = false
+    @Published private(set) var exportMessage = ""
 
     private let scanner = LibraryScanner()
     private var loaded = false
@@ -151,7 +251,7 @@ final class LibraryModel: ObservableObject {
             loaded = false
             return
         }
-        guard !scanning, force || !loaded || status != previous else { return }
+        guard !scanning, !exporting, force || !loaded || status != previous else { return }
         scanning = true
         progress = 0
         total = 0
@@ -182,6 +282,41 @@ final class LibraryModel: ObservableObject {
         refresh(force: true)
     }
 
+    var exportCount: Int {
+        days.reduce(0) { count, day in
+            count + day.groups.reduce(0) { subtotal, group in
+                subtotal + group.assets.filter { selected.contains($0.localIdentifier) }.count
+            }
+        }
+    }
+
+    func exportSelected() {
+        guard !exporting, !scanning else { return }
+        guard PHPhotoLibrary.authorizationStatus(for: .readWrite) == .authorized else {
+            exportMessage = "请在设置中为 PhotoMgr 开启照片完整访问，然后重试。"
+            return
+        }
+
+        let assets = days.flatMap(\.groups).flatMap(\.assets)
+            .filter { selected.contains($0.localIdentifier) }
+        guard !assets.isEmpty else { return }
+        exporting = true
+        exportDone = 0
+        exportTotal = assets.count
+        exportMessage = ""
+        AlbumExporter.export(assets) { [weak self] done in
+            DispatchQueue.main.async { self?.exportDone = done }
+        } completion: { [weak self] saved, failed in
+            DispatchQueue.main.async {
+                guard let self else { return }
+                self.exporting = false
+                self.exportMessage = failed == 0
+                    ? "已保存 \(saved) 张到「\(AlbumExporter.title)」。"
+                    : "已保存 \(saved) 张，\(failed) 张未能读取或保存。"
+            }
+        }
+    }
+
     func toggle(_ id: String) {
         if !selected.insert(id).inserted { selected.remove(id) }
         UserDefaults.standard.set(selected.sorted(), forKey: "selectedPhotoIDs")
@@ -195,6 +330,7 @@ struct LibraryView: View {
     @State private var date = Date()
     @State private var filterByDate = false
     @State private var selectedOnly = false
+    @State private var confirmingExport = false
 
     private var visibleDays: [PhotoDay] {
         model.days.compactMap { day in
@@ -239,10 +375,15 @@ struct LibraryView: View {
                 if model.canRead {
                     ToolbarItem(placement: .topBarTrailing) {
                         Button("重新扫描", systemImage: "arrow.clockwise") { model.refresh(force: true) }
-                            .disabled(model.scanning)
+                            .disabled(model.scanning || model.exporting)
                     }
                 }
             }
+        }
+        .confirmationDialog("保存 \(model.exportCount) 张调色成片？", isPresented: $confirmingExport, titleVisibility: .visible) {
+            Button("自动调色并保存") { model.exportSelected() }
+        } message: {
+            Text("将全部已勾选的照片另存到「PhotoMgr 调色成片」，保留原片。")
         }
         .task { model.refresh() }
         .onChange(of: scenePhase) { _, phase in
@@ -275,8 +416,29 @@ struct LibraryView: View {
                     Toggle("按日期查找", isOn: $filterByDate)
                     if filterByDate { DatePicker("拍摄日期", selection: $date, displayedComponents: .date) }
                     Toggle("只看已勾选", isOn: $selectedOnly)
+                    if model.status == .authorized {
+                        Button("自动调色并保存到相册", systemImage: "wand.and.stars") {
+                            confirmingExport = true
+                        }
+                        .buttonStyle(.borderedProminent)
+                        .disabled(model.exportCount == 0 || model.scanning || model.exporting)
+                    }
+                    if model.exporting {
+                        ProgressView(value: Double(model.exportDone), total: Double(model.exportTotal)) {
+                            Text("正在调色和保存 · \(model.exportDone) / \(model.exportTotal)")
+                        }
+                    }
+                    if !model.exportMessage.isEmpty {
+                        Text(model.exportMessage).font(.footnote).foregroundStyle(.secondary)
+                    }
                     if model.status == .limited {
-                        Text("当前仅显示你授权的照片。").font(.footnote).foregroundStyle(.secondary)
+                        Text("当前仅显示你授权的照片。保存到相册需要完整访问。")
+                            .font(.footnote).foregroundStyle(.secondary)
+                        Button("打开照片权限设置") {
+                            if let url = URL(string: UIApplication.openSettingsURLString) {
+                                UIApplication.shared.open(url)
+                            }
+                        }
                     }
                     if model.scanning {
                         if model.total > 0 {
