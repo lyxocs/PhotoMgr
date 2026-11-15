@@ -240,6 +240,7 @@ final class LibraryModel: ObservableObject {
 
     private let scanner = LibraryScanner()
     private var loaded = false
+    private var availableIDs: Set<String> = []
 
     var canRead: Bool { status == .authorized || status == .limited }
 
@@ -248,6 +249,7 @@ final class LibraryModel: ObservableObject {
         status = PHPhotoLibrary.authorizationStatus(for: .readWrite)
         guard canRead else {
             days = []
+            availableIDs = []
             loaded = false
             return
         }
@@ -270,6 +272,7 @@ final class LibraryModel: ObservableObject {
                     self.refresh(force: true)
                     return
                 }
+                self.availableIDs = Set(days.flatMap(\.groups).flatMap(\.assets).map(\.localIdentifier))
                 self.days = days
                 self.unavailable = unavailable
                 self.loaded = true
@@ -282,13 +285,7 @@ final class LibraryModel: ObservableObject {
         refresh(force: true)
     }
 
-    var exportCount: Int {
-        days.reduce(0) { count, day in
-            count + day.groups.reduce(0) { subtotal, group in
-                subtotal + group.assets.filter { selected.contains($0.localIdentifier) }.count
-            }
-        }
-    }
+    var exportCount: Int { selected.intersection(availableIDs).count }
 
     func exportSelected() {
         guard !exporting, !scanning else { return }
@@ -318,7 +315,15 @@ final class LibraryModel: ObservableObject {
     }
 
     func toggle(_ id: String) {
-        if !selected.insert(id).inserted { selected.remove(id) }
+        setSelected([id], to: !selected.contains(id))
+    }
+
+    func setSelected(_ ids: [String], to checked: Bool) {
+        if checked {
+            selected.formUnion(ids)
+        } else {
+            selected.subtract(ids)
+        }
         UserDefaults.standard.set(selected.sorted(), forKey: "selectedPhotoIDs")
     }
 }
@@ -327,16 +332,15 @@ final class LibraryModel: ObservableObject {
 struct LibraryView: View {
     @StateObject private var model = LibraryModel()
     @Environment(\.scenePhase) private var scenePhase
-    @State private var date = Date()
-    @State private var filterByDate = false
+    @State private var date: Date?
     @State private var selectedOnly = false
+    @State private var choosingDate = false
     @State private var confirmingExport = false
+    @State private var preview: PreviewSelection?
 
     private var visibleDays: [PhotoDay] {
         model.days.compactMap { day in
-            if filterByDate {
-                guard let dayDate = day.id, Calendar.current.isDate(dayDate, inSameDayAs: date) else { return nil }
-            }
+            if let date, day.id != date { return nil }
             guard selectedOnly else { return day }
             let groups = day.groups.compactMap { group -> PhotoGroup? in
                 let assets = group.assets.filter { model.selected.contains($0.localIdentifier) }
@@ -350,27 +354,24 @@ struct LibraryView: View {
         NavigationStack {
             Group {
                 if model.canRead {
-                    library
+                    library.safeAreaInset(edge: .bottom, spacing: 0) { selectionBar }
                 } else {
-                    VStack(spacing: 16) {
-                        Image(systemName: "photo.on.rectangle.angled").font(.largeTitle)
-                        Text("允许访问照片后，即可在手机上查找和分组。")
-                            .multilineTextAlignment(.center)
+                    ContentUnavailableView {
+                        Label("访问照片", systemImage: "photo.on.rectangle.angled")
+                    } description: {
+                        Text("允许访问后，即可按日期查找照片并浏览相似组。")
+                    } actions: {
                         if model.status == .notDetermined {
                             Button("允许访问照片") { Task { await model.requestAccess() } }
                                 .buttonStyle(.borderedProminent)
                         } else if model.status == .denied {
-                            Button("打开设置") {
-                                if let url = URL(string: UIApplication.openSettingsURLString) {
-                                    UIApplication.shared.open(url)
-                                }
-                            }
+                            Button("打开设置", action: openSettings).buttonStyle(.bordered)
                         }
                     }
-                    .padding(28)
                 }
             }
             .navigationTitle("PhotoMgr")
+            .navigationBarTitleDisplayMode(.inline)
             .toolbar {
                 if model.canRead {
                     ToolbarItem(placement: .topBarTrailing) {
@@ -380,15 +381,238 @@ struct LibraryView: View {
                 }
             }
         }
-        .confirmationDialog("保存 \(model.exportCount) 张调色成片？", isPresented: $confirmingExport, titleVisibility: .visible) {
+        .tint(Color(uiColor: .systemTeal))
+        .sheet(isPresented: $choosingDate) { datePicker }
+        .fullScreenCover(item: $preview) { selection in
+            PhotoPreview(model: model, selection: selection)
+        }
+        .confirmationDialog("保存 \(model.exportCount) 张调色成片？",
+                            isPresented: $confirmingExport, titleVisibility: .visible) {
             Button("自动调色并保存") { model.exportSelected() }
         } message: {
-            Text("将全部已勾选的照片另存到「PhotoMgr 调色成片」，保留原片。")
+            Text("将全部已勾选的照片另存到「PhotoMgr 调色成片」，包括当前筛选隐藏的照片。原片保留。")
         }
         .task { model.refresh() }
         .onChange(of: scenePhase) { _, phase in
-            if phase == .active { model.refresh(force: model.status == .limited) }
+            if phase == .active {
+                model.refresh(force: model.status == .limited)
+                if !model.canRead { preview = nil }
+            }
         }
+    }
+
+    private var library: some View {
+        let days = visibleDays
+        return ScrollView {
+            LazyVStack(alignment: .leading, spacing: 16, pinnedViews: [.sectionHeaders]) {
+                filters
+                libraryStatus
+                if days.isEmpty && !model.scanning {
+                    ContentUnavailableView(selectedOnly ? "没有已勾选的照片" : "没有照片",
+                                           systemImage: selectedOnly ? "checkmark.circle" : "photo.on.rectangle")
+                }
+                ForEach(days) { day in
+                    Section {
+                        ForEach(gridGroups(day.groups)) { group in
+                            groupGrid(group)
+                        }
+                    } header: {
+                        dayHeader(day)
+                    }
+                }
+            }
+            .padding(.horizontal, 12)
+        }
+        .background(Color(uiColor: .systemGroupedBackground))
+    }
+
+    private var filters: some View {
+        VStack(alignment: .leading, spacing: 10) {
+            Picker("照片筛选", selection: $selectedOnly) {
+                Text("全部照片").tag(false)
+                Text("已勾选").tag(true)
+            }
+            .pickerStyle(.segmented)
+            HStack {
+                Button { choosingDate = true } label: {
+                    Label {
+                        if let date {
+                            Text(date, format: .dateTime.year().month().day())
+                        } else {
+                            Text("按日期查找")
+                        }
+                    } icon: {
+                        Image(systemName: "calendar")
+                    }
+                }
+                .buttonStyle(.bordered)
+                .disabled(model.days.isEmpty)
+
+                if date != nil {
+                    Button("清除日期筛选", systemImage: "xmark.circle.fill") { date = nil }
+                        .labelStyle(.iconOnly)
+                        .frame(minWidth: 44, minHeight: 44)
+                }
+            }
+        }
+        .padding(.top, 10)
+    }
+
+    private var datePicker: some View {
+        NavigationStack {
+            List {
+                Button("所有日期") { applyDate(nil) }
+                ForEach(model.days.compactMap(\.id), id: \.self) { day in
+                    Button { applyDate(day) } label: {
+                        HStack {
+                            Text(day, format: .dateTime.year().month().day())
+                            Spacer()
+                            if day == date { Image(systemName: "checkmark") }
+                        }
+                    }
+                }
+            }
+            .navigationTitle("拍摄日期")
+            .navigationBarTitleDisplayMode(.inline)
+            .toolbar {
+                ToolbarItem(placement: .cancellationAction) {
+                    Button("关闭") { choosingDate = false }
+                }
+            }
+        }
+    }
+
+    @ViewBuilder
+    private var libraryStatus: some View {
+        if model.status == .limited {
+            VStack(alignment: .leading, spacing: 6) {
+                Text("当前仅显示你授权的照片。相册导出需要完整访问。")
+                Button("打开照片权限设置", action: openSettings)
+            }
+            .font(.subheadline)
+        }
+        if model.scanning {
+            if model.total > 0 {
+                ProgressView(value: Double(model.progress), total: Double(model.total)) {
+                    Text("正在分组 · \(model.progress) / \(model.total)")
+                }
+            } else {
+                ProgressView("正在读取相册")
+            }
+        } else if model.unavailable > 0 {
+            Text("\(model.unavailable) 张照片暂时单独显示，因为本地缩略图不可用。")
+                .font(.footnote)
+                .foregroundStyle(.secondary)
+        }
+    }
+
+    private var selectionBar: some View {
+        VStack(alignment: .leading, spacing: 8) {
+            if model.exporting {
+                ProgressView(value: Double(model.exportDone), total: Double(model.exportTotal)) {
+                    Text("正在调色和保存 · \(model.exportDone) / \(model.exportTotal)")
+                        .monospacedDigit()
+                }
+                .accessibilityLabel("导出进度")
+            } else if !model.exportMessage.isEmpty {
+                Text(model.exportMessage).font(.footnote)
+            }
+            ViewThatFits(in: .horizontal) {
+                HStack { selectionCount; Spacer(minLength: 16); exportButton }
+                VStack(alignment: .leading, spacing: 8) { selectionCount; exportButton }
+            }
+        }
+        .padding(.horizontal, 16)
+        .padding(.vertical, 10)
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .background(.regularMaterial)
+        .overlay(alignment: .top) { Divider() }
+    }
+
+    private var selectionCount: some View {
+        Text("已勾选 \(model.exportCount) 张")
+            .font(.subheadline.weight(.semibold))
+            .monospacedDigit()
+    }
+
+    @ViewBuilder
+    private var exportButton: some View {
+        if model.status == .authorized {
+            Button("调色并保存", systemImage: "wand.and.stars") { confirmingExport = true }
+                .buttonStyle(.borderedProminent)
+                .disabled(model.exportCount == 0 || model.scanning || model.exporting)
+                .accessibilityLabel("自动调色并保存到相册")
+        }
+    }
+
+    private func dayHeader(_ day: PhotoDay) -> some View {
+        HStack {
+            if let date = day.id {
+                Text(date, format: .dateTime.year().month().day()).font(.headline)
+            } else {
+                Text("无拍摄日期").font(.headline)
+            }
+            Spacer()
+            Text("\(day.groups.reduce(0) { $0 + $1.assets.count }) 张")
+                .font(.caption).foregroundStyle(.secondary)
+        }
+        .padding(.vertical, 8)
+        .background(Color(uiColor: .systemGroupedBackground))
+        .accessibilityAddTraits(.isHeader)
+    }
+
+    private func groupGrid(_ group: PhotoGroup) -> some View {
+        let similar = group.isSimilar && group.assets.count > 1
+        let ids = group.assets.map(\.localIdentifier)
+        let allChecked = ids.allSatisfy(model.selected.contains)
+        return VStack(alignment: .leading, spacing: 6) {
+            if similar {
+                HStack {
+                    Label("相似照片 · \(ids.count) 张", systemImage: "square.stack")
+                        .font(.subheadline.weight(.medium))
+                    Spacer()
+                    if !selectedOnly {
+                        Button(allChecked ? "取消整组" : "勾选整组") {
+                            model.setSelected(ids, to: !allChecked)
+                        }
+                        .font(.subheadline)
+                        .frame(minHeight: 44)
+                    }
+                }
+            }
+            LazyVGrid(columns: [GridItem(.adaptive(minimum: 94), spacing: 7)], spacing: 7) {
+                ForEach(group.assets, id: \.localIdentifier) { asset in
+                    let checked = model.selected.contains(asset.localIdentifier)
+                    ZStack(alignment: .topTrailing) {
+                        Button {
+                            preview = PreviewSelection(assets: similar ? group.assets : [asset], current: asset.localIdentifier)
+                        } label: {
+                            AssetImage(asset: asset, thumbnail: true)
+                                .aspectRatio(1, contentMode: .fit)
+                                .clipShape(RoundedRectangle(cornerRadius: 7))
+                        }
+                        .buttonStyle(.plain)
+                        .accessibilityLabel("查看照片")
+
+                        Button { model.toggle(asset.localIdentifier) } label: {
+                            Image(systemName: checked ? "checkmark.circle.fill" : "circle")
+                                .font(.title3.weight(.semibold))
+                                .foregroundStyle(checked ? Color(uiColor: .systemTeal) : .white)
+                                .padding(4)
+                                .background(.black.opacity(0.58), in: Circle())
+                                .frame(width: 44, height: 44)
+                                .contentShape(Rectangle())
+                        }
+                        .buttonStyle(.plain)
+                        .accessibilityLabel(checked ? "取消勾选照片" : "勾选照片")
+                        .accessibilityAddTraits(checked ? .isSelected : [])
+                    }
+                }
+            }
+        }
+        .padding(similar ? 8 : 0)
+        .background(similar ? Color(uiColor: .secondarySystemGroupedBackground) : .clear,
+                    in: RoundedRectangle(cornerRadius: 12))
     }
 
     private func gridGroups(_ groups: [PhotoGroup]) -> [PhotoGroup] {
@@ -409,132 +633,119 @@ struct LibraryView: View {
         return result
     }
 
-    private var library: some View {
-        ScrollView {
-            LazyVStack(alignment: .leading, spacing: 22) {
-                VStack(alignment: .leading, spacing: 12) {
-                    Toggle("按日期查找", isOn: $filterByDate)
-                    if filterByDate { DatePicker("拍摄日期", selection: $date, displayedComponents: .date) }
-                    Toggle("只看已勾选", isOn: $selectedOnly)
-                    if model.status == .authorized {
-                        Button("自动调色并保存到相册", systemImage: "wand.and.stars") {
-                            confirmingExport = true
-                        }
-                        .buttonStyle(.borderedProminent)
-                        .disabled(model.exportCount == 0 || model.scanning || model.exporting)
-                    }
-                    if model.exporting {
-                        ProgressView(value: Double(model.exportDone), total: Double(model.exportTotal)) {
-                            Text("正在调色和保存 · \(model.exportDone) / \(model.exportTotal)")
-                        }
-                    }
-                    if !model.exportMessage.isEmpty {
-                        Text(model.exportMessage).font(.footnote).foregroundStyle(.secondary)
-                    }
-                    if model.status == .limited {
-                        Text("当前仅显示你授权的照片。保存到相册需要完整访问。")
-                            .font(.footnote).foregroundStyle(.secondary)
-                        Button("打开照片权限设置") {
-                            if let url = URL(string: UIApplication.openSettingsURLString) {
-                                UIApplication.shared.open(url)
-                            }
-                        }
-                    }
-                    if model.scanning {
-                        if model.total > 0 {
-                            ProgressView(value: Double(model.progress), total: Double(model.total)) {
-                                Text("正在分组 · \(model.progress) / \(model.total)")
-                            }
-                        } else {
-                            ProgressView("正在读取相册")
-                        }
-                    } else if model.unavailable > 0 {
-                        Text("\(model.unavailable) 张照片的本地缩略图不可用，暂时单独显示。")
-                            .font(.footnote).foregroundStyle(.secondary)
-                    }
-                }
-                if visibleDays.isEmpty && !model.scanning {
-                    Text("没有符合条件的照片").foregroundStyle(.secondary)
-                }
-                ForEach(visibleDays) { day in
-                    VStack(alignment: .leading, spacing: 12) {
-                        if let date = day.id {
-                            Text(date, format: .dateTime.year().month().day()).font(.headline)
-                        } else {
-                            Text("无拍摄日期").font(.headline)
-                        }
-                        ForEach(gridGroups(day.groups)) { group in
-                            if group.isSimilar && group.assets.count > 1 {
-                                Text("相似照片 · \(group.assets.count) 张")
-                                    .font(.caption).foregroundStyle(.secondary)
-                            }
-                            LazyVGrid(columns: [GridItem(.adaptive(minimum: 96), spacing: 8)], spacing: 8) {
-                                ForEach(group.assets, id: \.localIdentifier) { asset in
-                                    let checked = model.selected.contains(asset.localIdentifier)
-                                    Button { model.toggle(asset.localIdentifier) } label: {
-                                        PhotoTile(asset: asset, checked: checked)
-                                    }
-                                    .buttonStyle(.plain)
-                                    .accessibilityLabel(checked ? "取消勾选照片" : "勾选照片")
-                                }
-                            }
-                        }
-                    }
-                }
-            }
-            .padding()
+    private func applyDate(_ day: Date?) {
+        date = day
+        choosingDate = false
+    }
+
+    private func openSettings() {
+        if let url = URL(string: UIApplication.openSettingsURLString) {
+            UIApplication.shared.open(url)
         }
     }
 }
 
-private struct PhotoTile: View {
+private struct PreviewSelection: Identifiable {
+    let assets: [PHAsset]
+    let current: String
+    var id: String { current }
+}
+
+@MainActor
+private struct PhotoPreview: View {
+    @ObservedObject var model: LibraryModel
+    let selection: PreviewSelection
+    @Environment(\.dismiss) private var dismiss
+    @State private var current: String
+
+    init(model: LibraryModel, selection: PreviewSelection) {
+        self.model = model
+        self.selection = selection
+        _current = State(initialValue: selection.current)
+    }
+
+    var body: some View {
+        let position = selection.assets.firstIndex { $0.localIdentifier == current } ?? 0
+        let checked = model.selected.contains(current)
+        VStack(spacing: 0) {
+            HStack {
+                Button("完成") { dismiss() }
+                Spacer()
+                Text("\(position + 1) / \(selection.assets.count)").monospacedDigit()
+                Spacer()
+                Button(checked ? "取消勾选" : "勾选", systemImage: checked ? "checkmark.circle.fill" : "circle") {
+                    model.toggle(current)
+                }
+            }
+            .padding(16)
+            TabView(selection: $current) {
+                ForEach(selection.assets, id: \.localIdentifier) { asset in
+                    AssetImage(asset: asset, thumbnail: false).tag(asset.localIdentifier)
+                }
+            }
+            .tabViewStyle(.page(indexDisplayMode: .never))
+        }
+        .background(.black)
+        .preferredColorScheme(.dark)
+    }
+}
+
+private struct AssetImage: View {
     let asset: PHAsset
-    let checked: Bool
+    let thumbnail: Bool
     @State private var image: UIImage?
     @State private var requestID: PHImageRequestID?
     @State private var generation = UUID()
+    @State private var unavailable = false
     private static let manager = PHCachingImageManager()
 
     var body: some View {
-        Color(uiColor: .secondarySystemBackground)
-            .aspectRatio(1, contentMode: .fit)
-            .overlay {
+        GeometryReader { geometry in
+            ZStack {
+                thumbnail ? Color(uiColor: .tertiarySystemFill) : .black
                 if let image {
-                    GeometryReader { geometry in
-                        Image(uiImage: image).resizable().scaledToFill()
-                            .frame(width: geometry.size.width, height: geometry.size.height)
-                            .clipped()
-                    }
+                    Image(uiImage: image).resizable()
+                        .aspectRatio(contentMode: thumbnail ? .fill : .fit)
+                        .frame(width: geometry.size.width, height: geometry.size.height)
+                        .clipped()
+                } else if unavailable {
+                    Image(systemName: "exclamationmark.icloud").foregroundStyle(.secondary)
+                        .accessibilityLabel("照片暂时无法读取")
+                } else if !thumbnail {
+                    ProgressView()
                 } else {
-                    Image(systemName: "photo").foregroundStyle(.secondary)
+                    Image(systemName: "photo").foregroundStyle(.tertiary)
                 }
             }
-            .overlay(alignment: .topTrailing) {
-                if checked {
-                    Image(systemName: "checkmark.circle.fill")
-                        .foregroundStyle(.white, Color.accentColor)
-                        .padding(6)
-                }
-            }
-            .clipShape(RoundedRectangle(cornerRadius: 8))
-            .onAppear(perform: load)
-            .onDisappear {
-                generation = UUID()
-                if let requestID { Self.manager.cancelImageRequest(requestID) }
-            }
+        }
+        .onAppear(perform: load)
+        .onDisappear {
+            generation = UUID()
+            if let requestID { Self.manager.cancelImageRequest(requestID) }
+            image = nil
+        }
     }
 
     private func load() {
         let token = UUID()
         generation = token
+        unavailable = false
         let options = PHImageRequestOptions()
         options.isNetworkAccessAllowed = true
         options.deliveryMode = .opportunistic
+        let dimension: CGFloat = thumbnail ? 360 : 1800
         requestID = Self.manager.requestImage(
-            for: asset, targetSize: CGSize(width: 360, height: 360), contentMode: .aspectFill, options: options
-        ) { result, _ in
+            for: asset, targetSize: CGSize(width: dimension, height: dimension),
+            contentMode: thumbnail ? .aspectFill : .aspectFit, options: options
+        ) { result, info in
+            let degraded = info?[PHImageResultIsDegradedKey] as? Bool ?? false
             DispatchQueue.main.async {
-                if generation == token, let result { image = result }
+                guard generation == token else { return }
+                if let result {
+                    image = result
+                } else if !degraded && image == nil {
+                    unavailable = true
+                }
             }
         }
     }
