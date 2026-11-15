@@ -1,0 +1,46 @@
+name: Build PhotoMgr IPA
+
+on:
+  push:
+    branches: [ios/altstore-build]
+    paths:
+      - 'ios/**'
+      - '.github/workflows/ios-ipa.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: macos-15
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build for iPhone
+        run: |
+          set -euo pipefail
+          xcodebuild -version
+          xcodebuild -project ios/PhotoMgr.xcodeproj -target PhotoMgr \
+            -configuration Release -sdk iphoneos ARCHS=arm64 \
+            CODE_SIGNING_ALLOWED=NO CONFIGURATION_BUILD_DIR="$RUNNER_TEMP/photomgr-build" build
+      - name: Package and verify IPA
+        run: |
+          set -euo pipefail
+          app="$RUNNER_TEMP/photomgr-build/PhotoMgr.app"
+          /usr/libexec/PlistBuddy -c 'Print :NSPhotoLibraryUsageDescription' "$app/Info.plist"
+          /usr/libexec/PlistBuddy -c 'Print :MinimumOSVersion' "$app/Info.plist"
+          xcrun lipo -verify_arch arm64 "$app/PhotoMgr"
+          mkdir -p "$RUNNER_TEMP/ipa/Payload"
+          ditto "$app" "$RUNNER_TEMP/ipa/Payload/PhotoMgr.app"
+          cd "$RUNNER_TEMP/ipa"
+          /usr/bin/zip -qry PhotoMgr.ipa Payload
+          /usr/bin/unzip -tq PhotoMgr.ipa
+          shasum -a 256 PhotoMgr.ipa > PhotoMgr.ipa.sha256
+      - uses: actions/upload-artifact@v4
+        with:
+          name: PhotoMgr-AltStore
+          path: |
+            ${{ runner.temp }}/ipa/PhotoMgr.ipa
+            ${{ runner.temp }}/ipa/PhotoMgr.ipa.sha256
+          if-no-files-found: error
