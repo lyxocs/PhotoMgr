@@ -30,7 +30,7 @@ jobs:
           app="$RUNNER_TEMP/photomgr-build/PhotoMgr.app"
           /usr/libexec/PlistBuddy -c 'Print :NSPhotoLibraryUsageDescription' "$app/Info.plist"
           /usr/libexec/PlistBuddy -c 'Print :MinimumOSVersion' "$app/Info.plist"
-          xcrun lipo -verify_arch arm64 "$app/PhotoMgr"
+          xcrun lipo "$app/PhotoMgr" -verify_arch arm64
           mkdir -p "$RUNNER_TEMP/ipa/Payload"
           ditto "$app" "$RUNNER_TEMP/ipa/Payload/PhotoMgr.app"
           cd "$RUNNER_TEMP/ipa"
